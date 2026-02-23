@@ -573,3 +573,34 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 
 	return nil
 }
+
+func setThenGetFeatureSameHandle(path string, setReport []byte, getReportID byte, length int) ([]byte, error) {
+	h, err := openHIDPath(path)
+	if err != nil {
+		return nil, err
+	}
+	defer closeHandle(h)
+
+	// Set
+	r1, _, _ := procHidDSetFeature_HID.Call(
+		uintptr(h),
+		uintptr(unsafe.Pointer(&setReport[0])),
+		uintptr(len(setReport)),
+	)
+	if r1 == 0 {
+		return nil, fmt.Errorf("HidD_SetFeature failed: %v", lastErrno())
+	}
+
+	// Get
+	buf := make([]byte, length)
+	buf[0] = getReportID
+	r2, _, _ := procHidDGetFeature_HID.Call(
+		uintptr(h),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	if r2 == 0 {
+		return nil, fmt.Errorf("HidD_GetFeature failed: %v", lastErrno())
+	}
+	return buf, nil
+}

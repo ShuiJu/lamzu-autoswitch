@@ -80,7 +80,7 @@ func tickOnce(cfg *Config, last *Applied) (string, string) {
 	}
 
 	*last = Applied{perf: wantPerf, poll: wantPoll, motionSync: wantMS, sleepSec: wantSleep, ok: true}
-
+	PrintBatteryINCA(dev)
 	if hit {
 		return fmt.Sprintf("[SWITCH] 命中白名单(%s) -> %s + %dHz + MS=%v + Sleep=%ds",
 			proc, perfName(wantPerf), wantPoll, wantMS, wantSleep), ""
