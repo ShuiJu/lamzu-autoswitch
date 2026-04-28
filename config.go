@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -48,6 +49,8 @@ type Config struct {
 	WhitelistSet map[string]struct{}
 	ConfigPath   string
 }
+
+var configWriteMu sync.Mutex
 
 func defaultConfigText() string {
 	return `# LAMZU INCA AutoSwitch 配置文件
@@ -99,6 +102,66 @@ func ensureConfigExists(path string) error {
 		return err
 	}
 	return os.WriteFile(path, []byte(defaultConfigText()), 0644)
+}
+
+func cloneConfig(src *Config) *Config {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	dst.Whitelist = append([]string(nil), src.Whitelist...)
+	dst.WhitelistSet = make(map[string]struct{}, len(src.WhitelistSet))
+	for k := range src.WhitelistSet {
+		dst.WhitelistSet[k] = struct{}{}
+	}
+	return &dst
+}
+
+func saveConfig(path string, cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("nil config")
+	}
+
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(formatConfig(cfg)), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func formatConfig(cfg *Config) string {
+	var b strings.Builder
+	b.WriteString("# LAMZU INCA AutoSwitch configuration\n")
+	b.WriteString("# Updates made from the tray GUI are written back immediately.\n\n")
+	fmt.Fprintf(&b, "interval_seconds=%d\n\n", int(cfg.Interval/time.Second))
+	fmt.Fprintf(&b, "default_mode=%s\n", perfName(cfg.DefaultMode))
+	fmt.Fprintf(&b, "default_poll=%d\n", cfg.DefaultPoll)
+	fmt.Fprintf(&b, "default_motion_sync=%s\n", onOff(cfg.DefaultMotionSync))
+	fmt.Fprintf(&b, "default_sleep_seconds=%d\n\n", cfg.DefaultSleepSec)
+	fmt.Fprintf(&b, "hit_mode=%s\n", perfName(cfg.HitMode))
+	fmt.Fprintf(&b, "hit_poll=%d\n", cfg.HitPoll)
+	fmt.Fprintf(&b, "hit_motion_sync=%s\n", onOff(cfg.HitMotionSync))
+	fmt.Fprintf(&b, "hit_sleep_seconds=%d\n\n", cfg.HitSleepSec)
+	b.WriteString("# whitelist process names, one per line\n")
+	for _, proc := range cfg.Whitelist {
+		proc = strings.TrimSpace(proc)
+		if proc == "" {
+			continue
+		}
+		b.WriteString(proc)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 func loadConfig(path string) (*Config, time.Time, error) {

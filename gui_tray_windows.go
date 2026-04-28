@@ -1,0 +1,957 @@
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"runtime"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+// Win32 COLORREF = 0x00BBGGRR
+const (
+	clrBg        = 0x00252525
+	clrAccent    = 0x003565FF
+	clrText      = 0x00F0F0F0
+	clrSeparator = 0x00444444
+)
+
+type RECT struct {
+	Left, Top, Right, Bottom int32
+}
+
+type PAINTSTRUCT struct {
+	Hdc         uintptr
+	FErase      int32
+	_pad1       int32
+	RcPaint     RECT
+	FRestore    int32
+	FIncUpdate  int32
+	RgbReserved [32]byte
+}
+
+type guiState struct {
+	app    *AutoSwitchApp
+	cancel context.CancelFunc
+
+	hInstance uintptr
+	mainHwnd  uintptr
+	cfgHwnd   uintptr
+
+	hdrStatusHW uintptr
+	statusLines [4]uintptr
+
+	uiFont     uintptr
+	statusFont uintptr
+	hbrBg      uintptr
+
+	appIcon   uintptr
+	appIconSm uintptr
+
+	currentProfile ProfileKind
+	statusNote     string
+
+	profileButtons map[ProfileKind]uintptr
+	perfButtons    map[PerfMode]uintptr
+	pollButtons    map[PollingRate]uintptr
+	motionButtons  map[bool]uintptr
+	sleepButtons   map[int]uintptr
+	controls       []uintptr
+	separatorYs    []int32
+
+	trayIcon NOTIFYICONDATA
+}
+
+type WNDCLASSEX struct {
+	CbSize        uint32
+	Style         uint32
+	LpfnWndProc   uintptr
+	CbClsExtra    int32
+	CbWndExtra    int32
+	HInstance     uintptr
+	HIcon         uintptr
+	HCursor       uintptr
+	HbrBackground uintptr
+	LpszMenuName  *uint16
+	LpszClassName *uint16
+	HIconSm       uintptr
+}
+
+type POINT struct {
+	X int32
+	Y int32
+}
+
+type MSG struct {
+	HWnd     uintptr
+	Message  uint32
+	WParam   uintptr
+	LParam   uintptr
+	Time     uint32
+	Pt       POINT
+	LPrivate uint32
+}
+
+type NOTIFYICONDATA struct {
+	CbSize           uint32
+	HWnd             uintptr
+	UID              uint32
+	UFlags           uint32
+	UCallbackMessage uint32
+	HIcon            uintptr
+	SzTip            [128]uint16
+	DwState          uint32
+	DwStateMask      uint32
+	SzInfo           [256]uint16
+	UVersion         uint32
+	SzInfoTitle      [64]uint16
+	DwInfoFlags      uint32
+	GuidItem         syscall.GUID
+	HBalloonIcon     uintptr
+}
+
+var (
+	user32GUI   = syscall.NewLazyDLL("user32.dll")
+	kernel32GUI = syscall.NewLazyDLL("kernel32.dll")
+	shell32GUI  = syscall.NewLazyDLL("shell32.dll")
+	gdi32GUI    = syscall.NewLazyDLL("gdi32.dll")
+	dwmapiGUI   = syscall.NewLazyDLL("dwmapi.dll")
+
+	procRegisterClassExW = user32GUI.NewProc("RegisterClassExW")
+	procCreateWindowExW  = user32GUI.NewProc("CreateWindowExW")
+	procDefWindowProcW   = user32GUI.NewProc("DefWindowProcW")
+	procDestroyWindow    = user32GUI.NewProc("DestroyWindow")
+	procShowWindow       = user32GUI.NewProc("ShowWindow")
+	procUpdateWindow     = user32GUI.NewProc("UpdateWindow")
+	procGetMessageW      = user32GUI.NewProc("GetMessageW")
+	procTranslateMessage = user32GUI.NewProc("TranslateMessage")
+	procDispatchMessageW = user32GUI.NewProc("DispatchMessageW")
+	procPostQuitMessage  = user32GUI.NewProc("PostQuitMessage")
+	procPostMessageW     = user32GUI.NewProc("PostMessageW")
+	procLoadCursorW      = user32GUI.NewProc("LoadCursorW")
+	procSendMessageW     = user32GUI.NewProc("SendMessageW")
+	procSetWindowTextW   = user32GUI.NewProc("SetWindowTextW")
+	procSetForegroundWin = user32GUI.NewProc("SetForegroundWindow")
+	procGetCursorPos     = user32GUI.NewProc("GetCursorPos")
+	procCreatePopupMenu  = user32GUI.NewProc("CreatePopupMenu")
+	procAppendMenuW      = user32GUI.NewProc("AppendMenuW")
+	procTrackPopupMenu   = user32GUI.NewProc("TrackPopupMenu")
+	procDestroyMenu      = user32GUI.NewProc("DestroyMenu")
+	procMessageBoxW      = user32GUI.NewProc("MessageBoxW")
+	procGetClientRect    = user32GUI.NewProc("GetClientRect")
+	procFillRect         = user32GUI.NewProc("FillRect")
+	procBeginPaint       = user32GUI.NewProc("BeginPaint")
+	procEndPaint         = user32GUI.NewProc("EndPaint")
+
+	procGetModuleHandleW = kernel32GUI.NewProc("GetModuleHandleW")
+
+	procCreateFontW      = gdi32GUI.NewProc("CreateFontW")
+	procDeleteObject     = gdi32GUI.NewProc("DeleteObject")
+	procCreateSolidBrush = gdi32GUI.NewProc("CreateSolidBrush")
+	procCreatePen        = gdi32GUI.NewProc("CreatePen")
+	procSelectObject     = gdi32GUI.NewProc("SelectObject")
+	procMoveToEx         = gdi32GUI.NewProc("MoveToEx")
+	procLineTo           = gdi32GUI.NewProc("LineTo")
+	procSetBkMode        = gdi32GUI.NewProc("SetBkMode")
+	procSetTextColor     = gdi32GUI.NewProc("SetTextColor")
+	procSetBkColor       = gdi32GUI.NewProc("SetBkColor")
+
+	procShellNotifyIconW      = shell32GUI.NewProc("Shell_NotifyIconW")
+	procDwmSetWindowAttribute = dwmapiGUI.NewProc("DwmSetWindowAttribute")
+)
+
+var globalGUI *guiState
+
+const (
+	classMain = "LamzuAutoSwitchTrayWindow"
+	classCfg  = "LamzuAutoSwitchConfigWindow"
+
+	wmAppTray = 0x8000 + 1
+
+	wmNull           = 0x0000
+	wmCommand        = 0x0111
+	wmClose          = 0x0010
+	wmDestroy        = 0x0002
+	wmPaint          = 0x000F
+	wmEraseBkgnd     = 0x0014
+	wmCtlColorStatic = 0x0138
+	wmCtlColorBtn    = 0x0135
+
+	wmLButtonDbl = 0x0203
+	wmRButtonUp  = 0x0205
+
+	wsOverlapped  = 0x00000000
+	wsCaption     = 0x00C00000
+	wsSysMenu     = 0x00080000
+	wsVisible     = 0x10000000
+	wsChild       = 0x40000000
+	wsGroup       = 0x00020000
+	wsTabStop     = 0x00010000
+	wsMinimizeBox = 0x00020000
+
+	bsAutoradio = 0x00000009
+
+	swHide = 0
+	swShow = 5
+
+	cwUseDefault = 0x80000000
+
+	mbOK        = 0x00000000
+	mbIconError = 0x00000010
+
+	bmSetCheck   = 0x00F1
+	wmSetFont    = 0x0030
+	bstChecked   = 1
+	bstUnchecked = 0
+
+	nimAdd        = 0x00000000
+	nimDelete     = 0x00000002
+	nimSetVersion = 0x00000004
+
+	nifMessage = 0x00000001
+	nifIcon    = 0x00000002
+	nifTip     = 0x00000004
+
+	notifyIconVersion4 = 4
+
+	mfString = 0x00000000
+
+	tpmLeftAlign   = 0x0000
+	tpmBottomAlign = 0x0020
+	tpmRightButton = 0x0002
+
+	idcArrow = 32512
+
+	idProfileHit     = 1001
+	idProfileDefault = 1002
+
+	idPerfOffice = 1101
+	idPerfSpeed  = 1102
+	idPerf20000  = 1103
+
+	idPoll1000 = 1201
+	idPoll2000 = 1202
+	idPoll4000 = 1203
+	idPoll8000 = 1204
+
+	idMSOff = 1301
+	idMSOn  = 1302
+
+	idSleep30   = 1401
+	idSleep60   = 1402
+	idSleep300  = 1403
+	idSleep600  = 1404
+	idCaptureFG = 1501
+
+	idMenuOpen = 9001
+	idMenuExit = 9002
+
+	perfUnchanged PerfMode = 0xff
+
+	transparent               = 1
+	psSolid                   = 0
+	dwmwaUseImmersiveDarkMode = 20
+
+	winW = 800
+	winH = 780
+)
+
+func runGUIApp() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cfgPath := filepath.Join(exeDir(), configFileName)
+	app, err := NewAutoSwitchApp(cfgPath)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go app.Run(ctx)
+
+	gui := &guiState{
+		app:            app,
+		cancel:         cancel,
+		currentProfile: ProfileHit,
+		profileButtons: map[ProfileKind]uintptr{},
+		perfButtons:    map[PerfMode]uintptr{},
+		pollButtons:    map[PollingRate]uintptr{},
+		motionButtons:  map[bool]uintptr{},
+		sleepButtons:   map[int]uintptr{},
+	}
+	globalGUI = gui
+
+	if err := gui.init(); err != nil {
+		cancel()
+		return err
+	}
+
+	gui.showConfigWindow()
+	gui.messageLoop()
+	cancel()
+	return nil
+}
+
+func (g *guiState) init() error {
+	instance, _, _ := procGetModuleHandleW.Call(0)
+	g.hInstance = instance
+
+	icon, smallIcon, err := loadEmbeddedAppIcons()
+	if err != nil {
+		return err
+	}
+	g.appIcon = icon
+	g.appIconSm = smallIcon
+
+	cursor, _, _ := procLoadCursorW.Call(0, idcArrow)
+	wndProc := syscall.NewCallback(guiWndProc)
+
+	g.hbrBg, _, _ = procCreateSolidBrush.Call(clrBg)
+
+	if err := registerWindowClass(classMain, instance, icon, smallIcon, cursor, wndProc, g.hbrBg); err != nil {
+		g.cleanupResources()
+		return err
+	}
+	if err := registerWindowClass(classCfg, instance, icon, smallIcon, cursor, wndProc, g.hbrBg); err != nil {
+		g.cleanupResources()
+		return err
+	}
+
+	mainHwnd, err := createTopLevelWindow(classMain, appDisplayName, instance, 0, 0)
+	if err != nil {
+		g.cleanupResources()
+		return err
+	}
+	g.mainHwnd = mainHwnd
+
+	cfgHwnd, err := createTopLevelWindow(classCfg, appDisplayName, instance, winW, winH)
+	if err != nil {
+		g.cleanupResources()
+		return err
+	}
+	g.cfgHwnd = cfgHwnd
+
+	g.uiFont = createUIFont(24, false)
+	g.statusFont = createUIFont(18, false)
+	g.buildControls()
+	g.applyFonts()
+	g.syncControls()
+
+	useDark := uintptr(1)
+	procDwmSetWindowAttribute.Call(cfgHwnd, dwmwaUseImmersiveDarkMode, uintptr(unsafe.Pointer(&useDark)), unsafe.Sizeof(useDark))
+
+	if err := g.addTrayIcon(smallIcon); err != nil {
+		g.cleanupResources()
+		return err
+	}
+	return nil
+}
+
+func registerWindowClass(name string, instance uintptr, icon uintptr, smallIcon uintptr, cursor uintptr, wndProc uintptr, bgBrush uintptr) error {
+	className := syscall.StringToUTF16Ptr(name)
+	wc := WNDCLASSEX{
+		CbSize:        uint32(unsafe.Sizeof(WNDCLASSEX{})),
+		LpfnWndProc:   wndProc,
+		HInstance:     instance,
+		HIcon:         icon,
+		HCursor:       cursor,
+		HbrBackground: bgBrush,
+		LpszClassName: className,
+		HIconSm:       smallIcon,
+	}
+	r, _, err := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+	if r == 0 {
+		return err
+	}
+	return nil
+}
+
+func createTopLevelWindow(className string, title string, instance uintptr, width int32, height int32) (uintptr, error) {
+	style := uintptr(wsOverlapped | wsCaption | wsSysMenu | wsMinimizeBox)
+	r, _, err := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(className))),
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(title))),
+		style,
+		uintptr(cwUseDefault),
+		uintptr(cwUseDefault),
+		uintptr(width),
+		uintptr(height),
+		0,
+		0,
+		instance,
+		0,
+	)
+	if r == 0 {
+		return 0, err
+	}
+	return r, nil
+}
+
+func (g *guiState) buildControls() {
+	const (
+		pad    = int32(30)
+		secH   = int32(36)
+		rowH   = int32(32)
+		secGap = int32(10)
+		blkGap = int32(16)
+		btnH   = int32(40)
+	)
+
+	colGap := int32(24)
+	twoColW := (winW - pad*2 - colGap) / 2
+	threeColGap := int32(18)
+	threeColW := (winW - pad*2 - threeColGap*2) / 3
+	fourColGap := int32(14)
+	fourColW := (winW - pad*2 - fourColGap*3) / 4
+
+	leftColX := pad
+	rightColX := pad + twoColW + colGap
+	perf2X := pad + threeColW + threeColGap
+	perf3X := perf2X + threeColW + threeColGap
+	sleep2X := pad + fourColW + fourColGap
+	sleep3X := sleep2X + fourColW + fourColGap
+	sleep4X := sleep3X + fourColW + fourColGap
+
+	y := int32(24)
+	g.hdrStatusHW = createLabel(g, pad, y, winW-pad*2, 36, "")
+	y += 54
+
+	createLabel(g, pad, y, winW-pad*2, secH, "Edit Target")
+	y += secH + secGap
+	g.profileButtons[ProfileHit] = createRadio(g, leftColX, y, twoColW, rowH, idProfileHit, "Hit Profile", true)
+	g.profileButtons[ProfileDefault] = createRadio(g, rightColX, y, twoColW, rowH, idProfileDefault, "Miss Profile", false)
+	y += rowH + blkGap
+	g.separatorYs = append(g.separatorYs, y-(blkGap/2))
+
+	createLabel(g, pad, y, winW-pad*2, secH, "Performance Mode")
+	y += secH + secGap
+	g.perfButtons[PerfOffice] = createRadio(g, leftColX, y, threeColW, rowH, idPerfOffice, "office", true)
+	g.perfButtons[PerfSpeed] = createRadio(g, perf2X, y, threeColW, rowH, idPerfSpeed, "speed", false)
+	g.perfButtons[Perf20000FPS] = createRadio(g, perf3X, y, threeColW, rowH, idPerf20000, "20000fps", false)
+	y += rowH + blkGap
+	g.separatorYs = append(g.separatorYs, y-(blkGap/2))
+
+	createLabel(g, pad, y, winW-pad*2, secH, "Motion Sync")
+	y += secH + secGap
+	g.motionButtons[false] = createRadio(g, leftColX, y, twoColW, rowH, idMSOff, "Off", true)
+	g.motionButtons[true] = createRadio(g, rightColX, y, twoColW, rowH, idMSOn, "On", false)
+	y += rowH + blkGap
+	g.separatorYs = append(g.separatorYs, y-(blkGap/2))
+
+	createLabel(g, pad, y, winW-pad*2, secH, "Polling Rate")
+	y += secH + secGap
+	g.pollButtons[Poll1000] = createRadio(g, leftColX, y, twoColW, rowH, idPoll1000, "1000 Hz", true)
+	g.pollButtons[Poll2000] = createRadio(g, rightColX, y, twoColW, rowH, idPoll2000, "2000 Hz", false)
+	y += rowH + secGap
+	g.pollButtons[Poll4000] = createRadio(g, leftColX, y, twoColW, rowH, idPoll4000, "4000 Hz", true)
+	g.pollButtons[Poll8000] = createRadio(g, rightColX, y, twoColW, rowH, idPoll8000, "8000 Hz", false)
+	y += rowH + blkGap
+	g.separatorYs = append(g.separatorYs, y-(blkGap/2))
+
+	createLabel(g, pad, y, winW-pad*2, secH, "Sleep Seconds")
+	y += secH + secGap
+	g.sleepButtons[30] = createRadio(g, pad, y, fourColW, rowH, idSleep30, "30", true)
+	g.sleepButtons[60] = createRadio(g, sleep2X, y, fourColW, rowH, idSleep60, "60", false)
+	g.sleepButtons[300] = createRadio(g, sleep3X, y, fourColW, rowH, idSleep300, "300", false)
+	g.sleepButtons[600] = createRadio(g, sleep4X, y, fourColW, rowH, idSleep600, "600", false)
+	y += rowH + blkGap
+	g.separatorYs = append(g.separatorYs, y-(blkGap/2))
+
+	createButton(g, pad, y, winW-pad*2, btnH, idCaptureFG, "Append Foreground Process In 10s")
+	y += btnH + 20
+
+	statusLineH := int32(24)
+	statusGap := int32(4)
+	for i := range g.statusLines {
+		g.statusLines[i] = createLabel(g, pad, y, winW-pad*2, statusLineH, "")
+		y += statusLineH + statusGap
+	}
+}
+
+func createLabel(g *guiState, x, y, w, h int32, text string) uintptr {
+	hwnd, _, _ := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("STATIC"))),
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(text))),
+		uintptr(wsChild|wsVisible),
+		uintptr(x),
+		uintptr(y),
+		uintptr(w),
+		uintptr(h),
+		g.cfgHwnd,
+		0,
+		g.hInstance,
+		0,
+	)
+	g.controls = append(g.controls, hwnd)
+	return hwnd
+}
+
+func createRadio(g *guiState, x, y, w, h int32, id int, text string, group bool) uintptr {
+	style := uintptr(wsChild | wsVisible | wsTabStop | bsAutoradio)
+	if group {
+		style |= wsGroup
+	}
+	hwnd, _, _ := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("BUTTON"))),
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(text))),
+		style,
+		uintptr(x),
+		uintptr(y),
+		uintptr(w),
+		uintptr(h),
+		g.cfgHwnd,
+		uintptr(id),
+		g.hInstance,
+		0,
+	)
+	g.controls = append(g.controls, hwnd)
+	return hwnd
+}
+
+func createButton(g *guiState, x, y, w, h int32, id int, text string) uintptr {
+	hwnd, _, _ := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("BUTTON"))),
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(text))),
+		uintptr(wsChild|wsVisible|wsTabStop),
+		uintptr(x),
+		uintptr(y),
+		uintptr(w),
+		uintptr(h),
+		g.cfgHwnd,
+		uintptr(id),
+		g.hInstance,
+		0,
+	)
+	g.controls = append(g.controls, hwnd)
+	return hwnd
+}
+
+func createUIFont(ptSize int32, bold bool) uintptr {
+	weight := uintptr(400)
+	if bold {
+		weight = 700
+	}
+	name := syscall.StringToUTF16Ptr("Segoe UI Variable Text")
+	font, _, _ := procCreateFontW.Call(
+		u32ptrFromI32(-ptSize),
+		0,
+		0,
+		0,
+		weight,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		uintptr(unsafe.Pointer(name)),
+	)
+	return font
+}
+
+func (g *guiState) applyFonts() {
+	if g.uiFont != 0 {
+		for _, hwnd := range g.controls {
+			procSendMessageW.Call(hwnd, wmSetFont, g.uiFont, 1)
+		}
+	}
+	if g.statusFont != 0 {
+		for _, hwnd := range g.statusLines {
+			procSendMessageW.Call(hwnd, wmSetFont, g.statusFont, 1)
+		}
+	}
+}
+
+func (g *guiState) addTrayIcon(icon uintptr) error {
+	g.trayIcon = NOTIFYICONDATA{
+		CbSize:           uint32(unsafe.Sizeof(NOTIFYICONDATA{})),
+		HWnd:             g.mainHwnd,
+		UID:              1,
+		UFlags:           nifMessage | nifIcon | nifTip,
+		UCallbackMessage: wmAppTray,
+		HIcon:            icon,
+		UVersion:         notifyIconVersion4,
+	}
+	copyUTF16(g.trayIcon.SzTip[:], appDisplayName)
+
+	r, _, err := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&g.trayIcon)))
+	if r == 0 {
+		return err
+	}
+	procShellNotifyIconW.Call(nimSetVersion, uintptr(unsafe.Pointer(&g.trayIcon)))
+	return nil
+}
+
+func (g *guiState) removeTrayIcon() {
+	if g.trayIcon.HWnd != 0 {
+		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&g.trayIcon)))
+	}
+}
+
+func (g *guiState) messageLoop() {
+	var msg MSG
+	for {
+		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if int32(r) <= 0 {
+			return
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+}
+
+func guiWndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
+	if globalGUI == nil {
+		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+		return r
+	}
+
+	switch msg {
+	case wmCommand:
+		globalGUI.handleCommand(controlID(wParam))
+		return 0
+	case wmPaint:
+		if hwnd == globalGUI.cfgHwnd {
+			globalGUI.paintWindow()
+			return 0
+		}
+	case wmEraseBkgnd:
+		if hwnd == globalGUI.cfgHwnd && globalGUI.hbrBg != 0 {
+			var rc RECT
+			procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+			procFillRect.Call(wParam, uintptr(unsafe.Pointer(&rc)), globalGUI.hbrBg)
+			return 1
+		}
+	case wmCtlColorStatic, wmCtlColorBtn:
+		procSetBkMode.Call(wParam, transparent)
+		procSetTextColor.Call(wParam, clrText)
+		procSetBkColor.Call(wParam, clrBg)
+		return globalGUI.hbrBg
+	case wmClose:
+		if hwnd == globalGUI.cfgHwnd {
+			procShowWindow.Call(hwnd, swHide)
+			return 0
+		}
+	case wmDestroy:
+		if hwnd == globalGUI.mainHwnd {
+			globalGUI.removeTrayIcon()
+			procPostQuitMessage.Call(0)
+			return 0
+		}
+	case wmAppTray:
+		switch trayEvent(lParam) {
+		case wmLButtonDbl:
+			globalGUI.showConfigWindow()
+		case wmRButtonUp:
+			globalGUI.showTrayMenu()
+		}
+		return 0
+	}
+
+	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+	return r
+}
+
+func (g *guiState) paintWindow() {
+	var ps PAINTSTRUCT
+	hdc, _, _ := procBeginPaint.Call(g.cfgHwnd, uintptr(unsafe.Pointer(&ps)))
+	if hdc == 0 {
+		return
+	}
+	defer procEndPaint.Call(g.cfgHwnd, uintptr(unsafe.Pointer(&ps)))
+
+	accentBrush, _, _ := procCreateSolidBrush.Call(clrAccent)
+	rc := RECT{Left: 0, Top: 0, Right: winW, Bottom: 4}
+	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rc)), accentBrush)
+	procDeleteObject.Call(accentBrush)
+
+	pen, _, _ := procCreatePen.Call(psSolid, 1, clrSeparator)
+	oldPen, _, _ := procSelectObject.Call(hdc, pen)
+	for _, y := range g.separatorYs {
+		procMoveToEx.Call(hdc, 30, uintptr(y), 0)
+		procLineTo.Call(hdc, uintptr(winW-30), uintptr(y))
+	}
+	procSelectObject.Call(hdc, oldPen)
+	procDeleteObject.Call(pen)
+}
+
+func (g *guiState) handleCommand(id int) {
+	switch id {
+	case idProfileHit:
+		g.currentProfile = ProfileHit
+		g.syncControls()
+	case idProfileDefault:
+		g.currentProfile = ProfileDefault
+		g.syncControls()
+	case idMenuOpen:
+		g.showConfigWindow()
+	case idMenuExit:
+		g.close()
+	case idCaptureFG:
+		g.statusNote = "Foreground process append queued for 10 seconds later."
+		g.scheduleForegroundAppend()
+		g.syncControls()
+	case idPerfOffice:
+		g.applySelection(PerfOffice, 0, -1, -1)
+	case idPerfSpeed:
+		g.applySelection(PerfSpeed, 0, -1, -1)
+	case idPerf20000:
+		g.applySelection(Perf20000FPS, 0, -1, -1)
+	case idPoll1000:
+		g.applySelection(perfUnchanged, Poll1000, -1, -1)
+	case idPoll2000:
+		g.applySelection(perfUnchanged, Poll2000, -1, -1)
+	case idPoll4000:
+		g.applySelection(perfUnchanged, Poll4000, -1, -1)
+	case idPoll8000:
+		g.applySelection(perfUnchanged, Poll8000, -1, -1)
+	case idMSOff:
+		g.applySelection(perfUnchanged, 0, 0, -1)
+	case idMSOn:
+		g.applySelection(perfUnchanged, 0, 1, -1)
+	case idSleep30:
+		g.applySelection(perfUnchanged, 0, -1, 30)
+	case idSleep60:
+		g.applySelection(perfUnchanged, 0, -1, 60)
+	case idSleep300:
+		g.applySelection(perfUnchanged, 0, -1, 300)
+	case idSleep600:
+		g.applySelection(perfUnchanged, 0, -1, 600)
+	}
+}
+
+func (g *guiState) applySelection(perf PerfMode, poll PollingRate, motionState int, sleepSec int) {
+	cfg := g.app.CurrentConfig()
+
+	var curPerf PerfMode
+	var curPoll PollingRate
+	var curMS bool
+	var curSleep int
+	if g.currentProfile == ProfileHit {
+		curPerf = cfg.HitMode
+		curPoll = cfg.HitPoll
+		curMS = cfg.HitMotionSync
+		curSleep = cfg.HitSleepSec
+	} else {
+		curPerf = cfg.DefaultMode
+		curPoll = cfg.DefaultPoll
+		curMS = cfg.DefaultMotionSync
+		curSleep = cfg.DefaultSleepSec
+	}
+
+	if perf == perfUnchanged {
+		perf = curPerf
+	}
+	if poll == 0 {
+		poll = curPoll
+	}
+	if sleepSec == -1 {
+		sleepSec = curSleep
+	}
+
+	useMotion := curMS
+	if motionState == 0 {
+		useMotion = false
+	} else if motionState == 1 {
+		useMotion = true
+	}
+
+	if err := g.app.UpdateProfile(g.currentProfile, perf, poll, useMotion, sleepSec); err != nil {
+		g.statusNote = "Write config failed."
+		g.syncControls()
+		showMessageBox(g.cfgHwnd, "Write config failed", err.Error(), mbOK|mbIconError)
+		return
+	}
+
+	g.statusNote = "Settings saved."
+	g.syncControls()
+}
+
+func (g *guiState) syncControls() {
+	cfg := g.app.CurrentConfig()
+
+	setChecked(g.profileButtons[ProfileHit], g.currentProfile == ProfileHit)
+	setChecked(g.profileButtons[ProfileDefault], g.currentProfile == ProfileDefault)
+
+	var perf PerfMode
+	var poll PollingRate
+	var motion bool
+	var sleep int
+	if g.currentProfile == ProfileHit {
+		perf = cfg.HitMode
+		poll = cfg.HitPoll
+		motion = cfg.HitMotionSync
+		sleep = cfg.HitSleepSec
+	} else {
+		perf = cfg.DefaultMode
+		poll = cfg.DefaultPoll
+		motion = cfg.DefaultMotionSync
+		sleep = cfg.DefaultSleepSec
+	}
+
+	for value, hwnd := range g.perfButtons {
+		setChecked(hwnd, value == perf)
+	}
+	for value, hwnd := range g.pollButtons {
+		setChecked(hwnd, value == poll)
+	}
+	for value, hwnd := range g.motionButtons {
+		setChecked(hwnd, value == motion)
+	}
+	for value, hwnd := range g.sleepButtons {
+		setChecked(hwnd, value == sleep)
+	}
+
+	devCount := g.app.DevCount()
+	logicalCount := g.app.LogicalDevCount()
+	devErr := g.app.LastDevError()
+	switch {
+	case devErr != "":
+		setWindowText(g.hdrStatusHW, "LAMZU Device: Not Connected")
+	case devCount > 0:
+		setWindowText(g.hdrStatusHW, fmt.Sprintf("LAMZU Device: %d connected", devCount))
+	default:
+		setWindowText(g.hdrStatusHW, "LAMZU Device: Scanning...")
+	}
+
+	statusNote := g.statusNote
+	if statusNote == "" {
+		statusNote = "Ready."
+	}
+
+	deviceLine := fmt.Sprintf("Device: %d connected  |  settings sync to detected devices", devCount)
+	if logicalCount > devCount && devCount > 0 {
+		deviceLine = fmt.Sprintf("Device: %d connected  |  %d logical HID interfaces detected", devCount, logicalCount)
+	}
+	if devErr != "" {
+		deviceLine = fmt.Sprintf("Device: %s", devErr)
+	}
+
+	setWindowText(g.statusLines[0], fmt.Sprintf("Editing: %s  |  Config: %s", profileName(g.currentProfile), filepath.Base(cfg.ConfigPath)))
+	setWindowText(g.statusLines[1], deviceLine)
+	setWindowText(g.statusLines[2], fmt.Sprintf("Target: %s  |  Poll: %d Hz  |  Motion Sync: %s  |  Sleep: %ds", perfName(perf), poll, onOff(motion), sleep))
+	setWindowText(g.statusLines[3], fmt.Sprintf("Status: %s  |  %s", statusNote, BatteryStatusTextINCA()))
+}
+
+func (g *guiState) scheduleForegroundAppend() {
+	g.app.ScheduleForegroundAppend(10 * time.Second)
+}
+
+func (g *guiState) showConfigWindow() {
+	g.syncControls()
+	procShowWindow.Call(g.cfgHwnd, swShow)
+	procUpdateWindow.Call(g.cfgHwnd)
+	procSetForegroundWin.Call(g.cfgHwnd)
+}
+
+func (g *guiState) showTrayMenu() {
+	menu, _, _ := procCreatePopupMenu.Call()
+	if menu == 0 {
+		return
+	}
+	procAppendMenuW.Call(menu, mfString, idMenuOpen, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Open Settings"))))
+	procAppendMenuW.Call(menu, mfString, idMenuExit, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Exit"))))
+
+	var pt POINT
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procSetForegroundWin.Call(g.mainHwnd)
+	procTrackPopupMenu.Call(menu, tpmLeftAlign|tpmBottomAlign|tpmRightButton, uintptr(pt.X), uintptr(pt.Y), 0, g.mainHwnd, 0)
+	procPostMessageW.Call(g.mainHwnd, wmNull, 0, 0)
+	procDestroyMenu.Call(menu)
+}
+
+func (g *guiState) close() {
+	if g.cancel != nil {
+		g.cancel()
+	}
+	g.app.CancelForegroundAppend()
+	if g.cfgHwnd != 0 {
+		procDestroyWindow.Call(g.cfgHwnd)
+		g.cfgHwnd = 0
+	}
+	if g.mainHwnd != 0 {
+		procDestroyWindow.Call(g.mainHwnd)
+		g.mainHwnd = 0
+	}
+	g.cleanupResources()
+}
+
+func (g *guiState) cleanupResources() {
+	if g.uiFont != 0 {
+		procDeleteObject.Call(g.uiFont)
+		g.uiFont = 0
+	}
+	if g.statusFont != 0 {
+		procDeleteObject.Call(g.statusFont)
+		g.statusFont = 0
+	}
+	if g.hbrBg != 0 {
+		procDeleteObject.Call(g.hbrBg)
+		g.hbrBg = 0
+	}
+	destroyIconHandle(g.appIconSm)
+	g.appIconSm = 0
+	destroyIconHandle(g.appIcon)
+	g.appIcon = 0
+}
+
+func showSimpleMessageBox(title string, message string) {
+	showMessageBox(0, title, message, mbOK|mbIconError)
+}
+
+func showMessageBox(hwnd uintptr, title string, message string, flags uintptr) {
+	procMessageBoxW.Call(
+		hwnd,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(message))),
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(title))),
+		flags,
+	)
+}
+
+func setChecked(hwnd uintptr, checked bool) {
+	state := uintptr(bstUnchecked)
+	if checked {
+		state = bstChecked
+	}
+	procSendMessageW.Call(hwnd, bmSetCheck, state, 0)
+}
+
+func setWindowText(hwnd uintptr, text string) {
+	procSetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(text))))
+}
+
+func controlID(wParam uintptr) int {
+	return int(uint16(wParam & 0xffff))
+}
+
+func trayEvent(lParam uintptr) uint32 {
+	return uint32(uint16(lParam & 0xffff))
+}
+
+func copyUTF16(dst []uint16, s string) {
+	src := syscall.StringToUTF16(s)
+	if len(src) > len(dst) {
+		src = src[:len(dst)]
+	}
+	copy(dst, src)
+	if len(src) == len(dst) {
+		dst[len(dst)-1] = 0
+	}
+}
+
+func profileName(profile ProfileKind) string {
+	if profile == ProfileHit {
+		return "Hit"
+	}
+	return "Miss (Default)"
+}

@@ -91,6 +91,8 @@ const (
 	FILE_SHARE_WRITE = 0x00000002
 
 	OPEN_EXISTING = 3
+
+	lamzuCommandInterval = 100 * time.Millisecond
 )
 
 func detailCbSizeW() uint32 {
@@ -281,7 +283,6 @@ func getFeature(path string, reportID byte, length int) ([]byte, error) {
 	}
 	return buf, nil
 }
-
 func EnumerateLamzuDevices() ([]LamzuDeviceInfo, error) {
 	g := hidGuid()
 
@@ -350,7 +351,7 @@ func EnumerateLamzuDevices() ([]LamzuDeviceInfo, error) {
 			continue
 		}
 
-		// 你日志里就是 0x37b0:0x0010，硬匹配最稳
+		// 浣犳棩蹇楅噷灏辨槸 0x37b0:0x0010锛岀‖鍖归厤鏈€绋?
 		if info.VID == 0x37b0 && info.PID == 0x0010 {
 			out = append(out, info)
 		}
@@ -358,7 +359,7 @@ func EnumerateLamzuDevices() ([]LamzuDeviceInfo, error) {
 	return out, nil
 }
 
-// ★强制：只允许 mi_02（对应 interface 2）
+// 鈽呭己鍒讹細鍙厑璁?mi_02锛堝搴?interface 2锛?
 func SelectLamzuControlPath() (LamzuDeviceInfo, error) {
 	ds, err := EnumerateLamzuDevices()
 	if err != nil {
@@ -371,7 +372,7 @@ func SelectLamzuControlPath() (LamzuDeviceInfo, error) {
 	for _, d := range ds {
 		lp := strings.ToLower(d.Path)
 		if strings.Contains(lp, "mi_02") && !strings.HasSuffix(lp, `\kbd`) {
-			log.Printf("[DEV] 强制选择 INCA 控制通道 mi_02: %s (FeatureLen=%d)", d.Path, int(d.FeatureLen))
+			log.Printf("[DEV] 寮哄埗閫夋嫨 INCA 鎺у埗閫氶亾 mi_02: %s (FeatureLen=%d)", d.Path, int(d.FeatureLen))
 			return d, nil
 		}
 	}
@@ -382,12 +383,37 @@ func FindOneLamzuDevice() (LamzuDeviceInfo, error) {
 	return SelectLamzuControlPath()
 }
 
-// ===== INCA 报文构造（来自抓包） =====
+func FindAllLamzuDevices() []LamzuDeviceInfo {
+	devs, err := EnumerateLamzuDevices()
+	if err != nil {
+		return nil
+	}
+	return devs
+}
 
-// 通用 CMD/VAL payload（抓包的 64B）：00 00 02 02 01 [CMD] 01 [VAL] ...
-// 注意：若 FeatureLen=65，则 buf[0] 为 ReportID(0)，payload 从 buf[1] 开始写
+func CountUniqueLamzuDevices(devs []LamzuDeviceInfo) int {
+	if len(devs) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(devs))
+	for _, dev := range devs {
+		lp := strings.ToLower(dev.Path)
+		if strings.Contains(lp, "mi_02") && !strings.HasSuffix(lp, `\kbd`) {
+			seen[lp] = struct{}{}
+		}
+	}
+	if len(seen) > 0 {
+		return len(seen)
+	}
+	return 1
+}
+
+// ===== INCA 鎶ユ枃鏋勯€狅紙鏉ヨ嚜鎶撳寘锛?=====
+
+// 閫氱敤 CMD/VAL payload锛堟姄鍖呯殑 64B锛夛細00 00 02 02 01 [CMD] 01 [VAL] ...
+// 娉ㄦ剰锛氳嫢 FeatureLen=65锛屽垯 buf[0] 涓?ReportID(0)锛宲ayload 浠?buf[1] 寮€濮嬪啓
 func buildIncaCmdVal(cmd, val byte, featureLen int) []byte {
-	// 抓包 payload 固定 64B
+	// 鎶撳寘 payload 鍥哄畾 64B
 	const payloadLen = 64
 	if featureLen <= 0 {
 		featureLen = payloadLen
@@ -399,13 +425,13 @@ func buildIncaCmdVal(cmd, val byte, featureLen int) []byte {
 	buf := make([]byte, featureLen)
 
 	off := 0
-	// FeatureReportByteLength 含 ReportID 字节时（你这里是 65）
+	// FeatureReportByteLength 鍚?ReportID 瀛楄妭鏃讹紙浣犺繖閲屾槸 65锛?
 	if featureLen == payloadLen+1 {
 		buf[0] = 0x00 // ReportID=0
 		off = 1
 	}
 
-	// payload 写入（严格按抓包）
+	// payload 鍐欏叆锛堜弗鏍兼寜鎶撳寘锛?
 	buf[off+0] = 0x00
 	buf[off+1] = 0x00
 	buf[off+2] = 0x02
@@ -414,12 +440,12 @@ func buildIncaCmdVal(cmd, val byte, featureLen int) []byte {
 	buf[off+5] = cmd
 	buf[off+6] = 0x01
 	buf[off+7] = val
-	// 其余自动为 0
+	// 鍏朵綑鑷姩涓?0
 	return buf
 }
 
-// 睡眠 payload（抓包的 64B）：00 00 02 03 00 07 01 [hi] [lo] ...
-// 秒数大端：seconds = hi*256 + lo（你抓包验证了 1800=0x0708，600=0x0258 等）[2](https://maynoothuniversity-my.sharepoint.com/personal/shengwei_huang_2022_mumail_ie/Documents/Microsoft%20Copilot%20Chat%20Files/%E7%8E%B0%E5%9C%A8%E7%9A%84%E4%BB%A3%E7%A0%81.txt)[3](https://maynoothuniversity-my.sharepoint.com/personal/shengwei_huang_2022_mumail_ie/Documents/Microsoft%20Copilot%20Chat%20Files/INCA%E6%8A%93%E5%8C%85%E7%AD%9B%E9%80%89%E7%BB%93%E6%9E%9C-%E5%88%86%E6%AE%B5.txt)
+// 鐫＄湢 payload锛堟姄鍖呯殑 64B锛夛細00 00 02 03 00 07 01 [hi] [lo] ...
+// 绉掓暟澶х锛歴econds = hi*256 + lo锛堜綘鎶撳寘楠岃瘉浜?1800=0x0708锛?00=0x0258 绛夛級[2](https://maynoothuniversity-my.sharepoint.com/personal/shengwei_huang_2022_mumail_ie/Documents/Microsoft%20Copilot%20Chat%20Files/%E7%8E%B0%E5%9C%A8%E7%9A%84%E4%BB%A3%E7%A0%81.txt)[3](https://maynoothuniversity-my.sharepoint.com/personal/shengwei_huang_2022_mumail_ie/Documents/Microsoft%20Copilot%20Chat%20Files/INCA%E6%8A%93%E5%8C%85%E7%AD%9B%E9%80%89%E7%BB%93%E6%9E%9C-%E5%88%86%E6%AE%B5.txt)
 func buildIncaSleep(sleepSec int, featureLen int) []byte {
 	const payloadLen = 64
 	if featureLen <= 0 {
@@ -446,7 +472,7 @@ func buildIncaSleep(sleepSec int, featureLen int) []byte {
 		off = 1
 	}
 
-	// payload 按抓包
+	// payload 鎸夋姄鍖?
 	buf[off+0] = 0x00
 	buf[off+1] = 0x00
 	buf[off+2] = 0x02
@@ -460,7 +486,7 @@ func buildIncaSleep(sleepSec int, featureLen int) []byte {
 }
 
 func dump12(tag string, b []byte) {
-	// 如果长度是 65，跳过第 0 字节 ReportID，打印 payload 的前 12 字节
+	// 濡傛灉闀垮害鏄?65锛岃烦杩囩 0 瀛楄妭 ReportID锛屾墦鍗?payload 鐨勫墠 12 瀛楄妭
 	start := 0
 	if len(b) == 65 {
 		start = 1
@@ -478,7 +504,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 		path = dev.Path
 	}
 
-	// 用 FeatureLen（取不到就 64）；写后回读也用同样长度
+	// 鐢?FeatureLen锛堝彇涓嶅埌灏?64锛夛紱鍐欏悗鍥炶涔熺敤鍚屾牱闀垮害
 	flen := int(dev.FeatureLen)
 	if flen <= 0 {
 		flen = 64
@@ -494,7 +520,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 	if err := sendFeatureReport(path, req); err != nil {
 		return fmt.Errorf("poll set failed: %w", err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(lamzuCommandInterval)
 	if resp, e := getFeature(path, 0x00, flen); e == nil {
 		dump12("[READ poll ]", resp)
 	}
@@ -509,7 +535,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 	if err := sendFeatureReport(path, req); err != nil {
 		return fmt.Errorf("motion sync set failed: %w", err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(lamzuCommandInterval)
 	if resp, e := getFeature(path, 0x00, flen); e == nil {
 		dump12("[READ ms   ]", resp)
 	}
@@ -522,7 +548,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 		if err := sendFeatureReport(path, req); err != nil {
 			return fmt.Errorf("office 0x0B failed: %w", err)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(lamzuCommandInterval)
 		req = buildIncaCmdVal(0x13, 0x00, flen)
 		dump12("[SEND 13   ]", req)
 		if err := sendFeatureReport(path, req); err != nil {
@@ -534,7 +560,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 		if err := sendFeatureReport(path, req); err != nil {
 			return fmt.Errorf("speed 0x0B failed: %w", err)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(lamzuCommandInterval)
 		req = buildIncaCmdVal(0x13, 0x00, flen)
 		dump12("[SEND 13   ]", req)
 		if err := sendFeatureReport(path, req); err != nil {
@@ -546,7 +572,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 		if err := sendFeatureReport(path, req); err != nil {
 			return fmt.Errorf("20000fps 0x0B failed: %w", err)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(lamzuCommandInterval)
 		req = buildIncaCmdVal(0x13, 0x01, flen)
 		dump12("[SEND 13   ]", req)
 		if err := sendFeatureReport(path, req); err != nil {
@@ -555,7 +581,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 	default:
 		return fmt.Errorf("unknown perf mode: %v", perf)
 	}
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(lamzuCommandInterval)
 	if resp, e := getFeature(path, 0x00, flen); e == nil {
 		dump12("[READ perf ]", resp)
 	}
@@ -566,7 +592,7 @@ func ApplyLamzuSetting(path string, perf PerfMode, poll PollingRate, motionSync 
 	if err := sendFeatureReport(path, req); err != nil {
 		return fmt.Errorf("sleep set failed: %w", err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(lamzuCommandInterval)
 	if resp, e := getFeature(path, 0x00, flen); e == nil {
 		dump12("[READ sleep]", resp)
 	}
