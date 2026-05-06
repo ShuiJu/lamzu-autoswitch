@@ -257,7 +257,7 @@ const (
 	dwmwaUseImmersiveDarkMode = 20
 
 	winW = 800
-	winH = 780
+	winH = 820
 )
 
 func runGUIApp() error {
